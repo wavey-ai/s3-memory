@@ -1,4 +1,6 @@
-use super::{empty, error, escape, make_object, timestamp, xml, Query};
+use super::{
+    empty, error, escape, make_object, remove_object, store_object_bounded, timestamp, xml, Query,
+};
 use crate::{Reply, State, Upload};
 use bytes::Bytes;
 use http_body_util::Full;
@@ -18,7 +20,9 @@ pub(super) fn delete_objects(state: &mut State, bucket: &str, payload: &[u8]) ->
     };
     let mut result = String::from("<DeleteResult>");
     for key in keys {
-        bucket_state.objects.remove(&key);
+        if let Some(size) = remove_object(bucket_state, &key) {
+            state.stored_bytes -= size;
+        }
         result.push_str(&format!("<Deleted><Key>{}</Key></Deleted>", escape(&key)));
     }
     result.push_str("</DeleteResult>");
@@ -59,6 +63,7 @@ pub(super) fn create_upload(
     ))
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(super) fn upload_request(
     state: &mut State,
     method: &Method,
@@ -67,6 +72,7 @@ pub(super) fn upload_request(
     id: &str,
     query: &Query,
     payload: Bytes,
+    max_stored_bytes: usize,
 ) -> Reply {
     let Some(upload) = state.uploads.get_mut(id) else {
         return error(StatusCode::NOT_FOUND, "NoSuchUpload", id);
@@ -85,7 +91,19 @@ pub(super) fn upload_request(
             };
             let object = make_object(payload, &hyper::HeaderMap::new());
             let etag = object.etag.clone();
+            let old_size = upload.parts.get(&number).map_or(0, |part| part.bytes.len());
+            let Some(new_size) = state
+                .stored_bytes
+                .checked_sub(old_size)
+                .and_then(|size| size.checked_add(object.bytes.len()))
+            else {
+                return error(StatusCode::INSUFFICIENT_STORAGE, "StorageFull", key);
+            };
+            if new_size > max_stored_bytes {
+                return error(StatusCode::INSUFFICIENT_STORAGE, "StorageFull", key);
+            }
             upload.parts.insert(number, object);
+            state.stored_bytes = new_size;
             hyper::Response::builder()
                 .status(StatusCode::OK)
                 .header(ETAG, etag)
@@ -103,7 +121,13 @@ pub(super) fn upload_request(
             xml(StatusCode::OK, result)
         }
         Method::DELETE => {
+            let released = upload
+                .parts
+                .values()
+                .map(|part| part.bytes.len())
+                .sum::<usize>();
             state.uploads.remove(id);
+            state.stored_bytes -= released;
             empty(StatusCode::NO_CONTENT)
         }
         Method::POST => {
@@ -142,12 +166,28 @@ pub(super) fn upload_request(
             object.content_type = upload.content_type.clone();
             object.metadata = upload.metadata.clone();
             let etag = object.etag.clone();
-            state
-                .buckets
-                .get_mut(bucket)
-                .unwrap()
+            let released = upload
+                .parts
+                .values()
+                .map(|part| part.bytes.len())
+                .sum::<usize>();
+            let old_size = state.buckets[bucket]
                 .objects
-                .insert(key.to_owned(), object);
+                .get(key)
+                .map_or(0, |entry| entry.object.bytes.len());
+            let Some(new_size) = state
+                .stored_bytes
+                .checked_sub(released)
+                .and_then(|size| size.checked_sub(old_size))
+                .and_then(|size| size.checked_add(object.bytes.len()))
+            else {
+                return error(StatusCode::INSUFFICIENT_STORAGE, "StorageFull", key);
+            };
+            if new_size > max_stored_bytes {
+                return error(StatusCode::INSUFFICIENT_STORAGE, "StorageFull", key);
+            }
+            state.stored_bytes -= released;
+            store_object_bounded(state, bucket, key.to_owned(), object, max_stored_bytes).unwrap();
             state.uploads.remove(id);
             xml(StatusCode::OK, format!("<CompleteMultipartUploadResult><Bucket>{}</Bucket><Key>{}</Key><ETag>{etag}</ETag></CompleteMultipartUploadResult>",
                 escape(bucket), escape(key)))

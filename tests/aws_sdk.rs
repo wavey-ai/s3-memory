@@ -176,7 +176,8 @@ async fn bucket_objects_ranges_copy_listing_and_deletion() {
 
 #[tokio::test]
 async fn multipart_upload_and_abort() {
-    let server = MemoryS3::new().start().await.unwrap();
+    let store = MemoryS3::new();
+    let server = store.start().await.unwrap();
     let s3 = client(server.endpoint());
     s3.create_bucket().bucket("multipart").send().await.unwrap();
     let upload = s3
@@ -220,6 +221,7 @@ async fn multipart_upload_and_abort() {
                 .build(),
         );
     }
+    assert_eq!(store.stored_bytes(), 10);
     assert_eq!(
         s3.list_parts()
             .bucket("multipart")
@@ -244,6 +246,7 @@ async fn multipart_upload_and_abort() {
         .send()
         .await
         .unwrap();
+    assert_eq!(store.stored_bytes(), 10);
     let head = s3
         .head_object()
         .bucket("multipart")
@@ -291,12 +294,89 @@ async fn multipart_upload_and_abort() {
         .send()
         .await
         .unwrap();
+    assert_eq!(store.stored_bytes(), 10);
     s3.delete_object()
         .bucket("multipart")
         .key("large")
         .send()
         .await
         .unwrap();
+    assert_eq!(store.stored_bytes(), 0);
     s3.delete_bucket().bucket("multipart").send().await.unwrap();
+    server.stop().await;
+}
+
+#[tokio::test]
+async fn capacity_applies_to_http_objects_and_multipart_parts() {
+    let store = MemoryS3::new().with_max_stored_bytes(8);
+    let server = store.start().await.unwrap();
+    let s3 = client(server.endpoint());
+    s3.create_bucket().bucket("limited").send().await.unwrap();
+    s3.put_object()
+        .bucket("limited")
+        .key("keep")
+        .body(ByteStream::from_static(b"123456"))
+        .send()
+        .await
+        .unwrap();
+    assert!(s3
+        .put_object()
+        .bucket("limited")
+        .key("keep")
+        .body(ByteStream::from_static(b"123456789"))
+        .send()
+        .await
+        .is_err());
+    assert_eq!(store.stored_bytes(), 6);
+    assert_eq!(store.get_object("limited", "keep").unwrap(), "123456");
+    assert!(s3
+        .copy_object()
+        .bucket("limited")
+        .key("copy")
+        .copy_source("limited/keep")
+        .send()
+        .await
+        .is_err());
+    assert_eq!(store.stored_bytes(), 6);
+    let id = s3
+        .create_multipart_upload()
+        .bucket("limited")
+        .key("pending")
+        .send()
+        .await
+        .unwrap()
+        .upload_id()
+        .unwrap()
+        .to_owned();
+    assert!(s3
+        .upload_part()
+        .bucket("limited")
+        .key("pending")
+        .upload_id(&id)
+        .part_number(1)
+        .body(ByteStream::from_static(b"123"))
+        .send()
+        .await
+        .is_err());
+    let part = s3
+        .upload_part()
+        .bucket("limited")
+        .key("pending")
+        .upload_id(&id)
+        .part_number(1)
+        .body(ByteStream::from_static(b"12"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(store.stored_bytes(), 8);
+    s3.abort_multipart_upload()
+        .bucket("limited")
+        .key("pending")
+        .upload_id(id)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(store.stored_bytes(), 6);
+    assert!(part.e_tag().is_some());
     server.stop().await;
 }

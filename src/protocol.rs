@@ -1,4 +1,5 @@
-use crate::{Bucket, Object, Reply, State};
+use crate::{Bucket, Object, ObjectEntry, Reply, State};
+use arc_swap::ArcSwapOption;
 use bytes::Bytes;
 use chrono::{DateTime, Utc};
 use http_body_util::Full;
@@ -7,6 +8,7 @@ use hyper::{Method, StatusCode};
 use md5::{Digest, Md5};
 use percent_encoding::percent_decode_str;
 use std::collections::{BTreeMap, HashMap};
+use std::sync::Arc;
 use std::time::SystemTime;
 use url::form_urlencoded;
 
@@ -14,10 +16,98 @@ mod multipart;
 
 type Query = HashMap<String, String>;
 
+pub(crate) enum HotRead {
+    Found(Arc<Object>),
+    MissingBucket(String),
+    MissingKey(String),
+}
+
+pub(crate) fn hot_lookup(state: &State, parts: &hyper::http::request::Parts) -> Option<HotRead> {
+    if parts.method != Method::GET && parts.method != Method::HEAD {
+        return None;
+    }
+    if parts.uri.query().is_some_and(|query| {
+        form_urlencoded::parse(query.as_bytes()).any(|(name, _)| name != "x-id")
+    }) {
+        return None;
+    }
+    let path = percent_decode_str(parts.uri.path()).decode_utf8_lossy();
+    let (bucket, key) = path.trim_start_matches('/').split_once('/')?;
+    if bucket.is_empty() || key.is_empty() {
+        return None;
+    }
+    Some(match state.buckets.get(bucket) {
+        None => HotRead::MissingBucket(bucket.to_owned()),
+        Some(bucket_state) => match bucket_state.objects.get(key) {
+            Some(entry) => HotRead::Found(Arc::clone(&entry.object)),
+            None => HotRead::MissingKey(key.to_owned()),
+        },
+    })
+}
+
+pub(crate) fn basic_put_path(parts: &hyper::http::request::Parts) -> Option<(String, String)> {
+    if parts.method != Method::PUT || parts.headers.contains_key("x-amz-copy-source") {
+        return None;
+    }
+    if parts.uri.query().is_some_and(|query| {
+        form_urlencoded::parse(query.as_bytes()).any(|(name, _)| name != "x-id")
+    }) {
+        return None;
+    }
+    let path = percent_decode_str(parts.uri.path()).decode_utf8_lossy();
+    let (bucket, key) = path.trim_start_matches('/').split_once('/')?;
+    if bucket.is_empty() || key.is_empty() {
+        return None;
+    }
+    Some((bucket.to_owned(), key.to_owned()))
+}
+
+pub(crate) fn write_object(
+    state: &mut State,
+    bucket: &str,
+    key: String,
+    object: Object,
+    max_stored_bytes: usize,
+) -> Reply {
+    if !state.buckets.contains_key(bucket) {
+        return error(StatusCode::NOT_FOUND, "NoSuchBucket", bucket);
+    }
+    let etag = object.etag.clone();
+    if store_object_bounded(state, bucket, key.clone(), object, max_stored_bytes).is_err() {
+        return error(StatusCode::INSUFFICIENT_STORAGE, "StorageFull", &key);
+    }
+    hyper::Response::builder()
+        .status(StatusCode::OK)
+        .header(ETAG, etag)
+        .body(Full::new(Bytes::new()))
+        .unwrap()
+}
+
+pub(crate) fn render_hot(snapshot: HotRead, parts: &hyper::http::request::Parts) -> Reply {
+    match snapshot {
+        HotRead::Found(object) => read_object(&object, &parts.method, &parts.headers),
+        HotRead::MissingBucket(bucket) => {
+            if parts.method == Method::HEAD {
+                empty(StatusCode::NOT_FOUND)
+            } else {
+                error(StatusCode::NOT_FOUND, "NoSuchBucket", &bucket)
+            }
+        }
+        HotRead::MissingKey(key) => {
+            if parts.method == Method::HEAD {
+                empty(StatusCode::NOT_FOUND)
+            } else {
+                error(StatusCode::NOT_FOUND, "NoSuchKey", &key)
+            }
+        }
+    }
+}
+
 pub(crate) fn route(
     state: &mut State,
     parts: &hyper::http::request::Parts,
     payload: Bytes,
+    max_stored_bytes: usize,
 ) -> Reply {
     let path = percent_decode_str(parts.uri.path()).decode_utf8_lossy();
     let mut path_parts = path.trim_start_matches('/').splitn(2, '/');
@@ -46,6 +136,7 @@ pub(crate) fn route(
         &query,
         &parts.headers,
         payload,
+        max_stored_bytes,
     )
 }
 
@@ -102,6 +193,7 @@ fn bucket_request(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn object_request(
     state: &mut State,
     method: &Method,
@@ -110,6 +202,7 @@ fn object_request(
     query: &Query,
     headers: &hyper::HeaderMap,
     payload: Bytes,
+    max_stored_bytes: usize,
 ) -> Reply {
     if !state.buckets.contains_key(bucket) {
         return error(StatusCode::NOT_FOUND, "NoSuchBucket", bucket);
@@ -118,7 +211,16 @@ fn object_request(
         return multipart::create_upload(state, bucket, key, headers);
     }
     if let Some(id) = query.get("uploadId") {
-        return multipart::upload_request(state, method, bucket, key, id, query, payload);
+        return multipart::upload_request(
+            state,
+            method,
+            bucket,
+            key,
+            id,
+            query,
+            payload,
+            max_stored_bytes,
+        );
     }
     if !query.is_empty() {
         return error(StatusCode::NOT_IMPLEMENTED, "NotImplemented", key);
@@ -135,20 +237,25 @@ fn object_request(
                 .buckets
                 .get(source_bucket)
                 .and_then(|b| b.objects.get(source_key))
-                .cloned()
+                .map(|entry| Arc::clone(&entry.object))
             else {
                 return error(StatusCode::NOT_FOUND, "NoSuchKey", source_key);
             };
             let copied = Object {
                 modified: SystemTime::now(),
-                ..original
+                ..(*original).clone()
             };
-            state
-                .buckets
-                .get_mut(bucket)
-                .unwrap()
-                .objects
-                .insert(key.to_owned(), copied.clone());
+            if store_object_bounded(
+                state,
+                bucket,
+                key.to_owned(),
+                copied.clone(),
+                max_stored_bytes,
+            )
+            .is_err()
+            {
+                return error(StatusCode::INSUFFICIENT_STORAGE, "StorageFull", key);
+            }
             return xml(StatusCode::OK, format!(
                 "<CopyObjectResult><LastModified>{}</LastModified><ETag>{}</ETag></CopyObjectResult>",
                 timestamp(copied.modified), copied.etag,
@@ -156,12 +263,9 @@ fn object_request(
         }
         let object = make_object(payload, headers);
         let etag = object.etag.clone();
-        state
-            .buckets
-            .get_mut(bucket)
-            .unwrap()
-            .objects
-            .insert(key.to_owned(), object);
+        if store_object_bounded(state, bucket, key.to_owned(), object, max_stored_bytes).is_err() {
+            return error(StatusCode::INSUFFICIENT_STORAGE, "StorageFull", key);
+        }
         return hyper::Response::builder()
             .status(StatusCode::OK)
             .header(ETAG, etag)
@@ -169,20 +273,77 @@ fn object_request(
             .unwrap();
     }
     if *method == Method::DELETE {
-        state.buckets.get_mut(bucket).unwrap().objects.remove(key);
+        if let Some(size) = remove_object(state.buckets.get_mut(bucket).unwrap(), key) {
+            state.stored_bytes -= size;
+        }
         return empty(StatusCode::NO_CONTENT);
     }
     if *method == Method::GET || *method == Method::HEAD {
-        let Some(object) = state.buckets.get(bucket).and_then(|b| b.objects.get(key)) else {
+        let Some(object) = state
+            .buckets
+            .get(bucket)
+            .and_then(|b| b.objects.get(key))
+            .map(|entry| Arc::clone(&entry.object))
+        else {
             return if *method == Method::HEAD {
                 empty(StatusCode::NOT_FOUND)
             } else {
                 error(StatusCode::NOT_FOUND, "NoSuchKey", key)
             };
         };
-        return read_object(object, method, headers);
+        return read_object(&object, method, headers);
     }
     error(StatusCode::NOT_IMPLEMENTED, "NotImplemented", key)
+}
+
+pub(crate) fn store_object(bucket: &mut Bucket, key: String, object: Object) {
+    let object = Arc::new(object);
+    match bucket.objects.entry(key) {
+        std::collections::hash_map::Entry::Occupied(mut entry) => {
+            entry.get_mut().slot.store(Some(Arc::clone(&object)));
+            entry.get_mut().object = object;
+        }
+        std::collections::hash_map::Entry::Vacant(entry) => {
+            entry.insert(ObjectEntry {
+                object: Arc::clone(&object),
+                slot: Arc::new(ArcSwapOption::new(Some(object))),
+            });
+        }
+    }
+}
+
+pub(crate) fn store_object_bounded(
+    state: &mut State,
+    bucket: &str,
+    key: String,
+    object: Object,
+    max_stored_bytes: usize,
+) -> Result<(), ()> {
+    let old_size = state.buckets[bucket]
+        .objects
+        .get(&key)
+        .map_or(0, |entry| entry.object.bytes.len());
+    let new_size = state
+        .stored_bytes
+        .checked_sub(old_size)
+        .and_then(|size| size.checked_add(object.bytes.len()))
+        .ok_or(())?;
+    if new_size > max_stored_bytes {
+        return Err(());
+    }
+    store_object(state.buckets.get_mut(bucket).unwrap(), key, object);
+    state.stored_bytes = new_size;
+    Ok(())
+}
+
+pub(crate) fn remove_object(bucket: &mut Bucket, key: &str) -> Option<usize> {
+    if let Some(entry) = bucket.objects.remove(key) {
+        let size = entry.object.bytes.len();
+        entry.slot.store(None);
+        Some(size)
+    } else {
+        None
+    }
 }
 
 pub(crate) fn make_object(bytes: Bytes, headers: &hyper::HeaderMap) -> Object {
@@ -300,19 +461,26 @@ fn list_objects(state: &State, bucket: &str, query: &Query) -> Reply {
         .and_then(|v| v.parse::<usize>().ok())
         .unwrap_or(1000)
         .min(1000);
-    let mut entries: BTreeMap<String, (String, Option<&Object>)> = BTreeMap::new();
-    for (key, object) in &bucket_state.objects {
+    let mut entries: BTreeMap<String, (String, Option<Arc<Object>>)> = BTreeMap::new();
+    for (key, entry) in &bucket_state.objects {
         if !key.starts_with(prefix) || (!after.is_empty() && key.as_str() <= after) {
             continue;
         }
         if !delimiter.is_empty() {
             if let Some(index) = key[prefix.len()..].find(delimiter) {
                 let common_prefix = &key[..prefix.len() + index + delimiter.len()];
-                entries.insert(common_prefix.to_owned(), (key.clone(), None));
+                entries
+                    .entry(common_prefix.to_owned())
+                    .and_modify(|(last, _)| {
+                        if key > last {
+                            *last = key.clone();
+                        }
+                    })
+                    .or_insert_with(|| (key.clone(), None));
                 continue;
             }
         }
-        entries.insert(key.clone(), (key.clone(), Some(object)));
+        entries.insert(key.clone(), (key.clone(), Some(Arc::clone(&entry.object))));
     }
     let entries = entries.into_iter().collect::<Vec<_>>();
     let truncated = max > 0 && entries.len() > max;

@@ -6,6 +6,7 @@ description = "In-memory S3-compatible HTTP server for tests"
 license = "MIT"
 
 [dependencies]
+arc-swap = "1"
 bytes = "1.6"
 chrono = { version = "0.4", default-features = false, features = ["clock"] }
 http-body-util = "0.1"
