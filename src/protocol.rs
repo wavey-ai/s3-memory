@@ -85,7 +85,7 @@ pub(crate) fn write_object(
 
 pub(crate) fn render_hot(snapshot: HotRead, parts: &hyper::http::request::Parts) -> Reply {
     match snapshot {
-        HotRead::Found(object) => read_object(&object, &parts.method, &parts.headers),
+        HotRead::Found(object) => read_object(&object, &parts.method, &parts.headers, &[]),
         HotRead::MissingBucket(bucket) => {
             if parts.method == Method::HEAD {
                 empty(StatusCode::NOT_FOUND)
@@ -222,7 +222,15 @@ fn object_request(
             max_stored_bytes,
         );
     }
-    if !query.is_empty() {
+    // A GET may override its response headers through S3's `response-*` parameters.
+    let overrides: Vec<(String, String)> = query
+        .iter()
+        .filter_map(|(name, value)| {
+            name.strip_prefix("response-")
+                .map(|header| (header.to_owned(), value.clone()))
+        })
+        .collect();
+    if query.keys().any(|name| !name.starts_with("response-")) {
         return error(StatusCode::NOT_IMPLEMENTED, "NotImplemented", key);
     }
     if *method == Method::PUT {
@@ -291,7 +299,7 @@ fn object_request(
                 error(StatusCode::NOT_FOUND, "NoSuchKey", key)
             };
         };
-        return read_object(&object, method, headers);
+        return read_object(&object, method, headers, &overrides);
     }
     error(StatusCode::NOT_IMPLEMENTED, "NotImplemented", key)
 }
@@ -368,7 +376,12 @@ pub(crate) fn make_object(bytes: Bytes, headers: &hyper::HeaderMap) -> Object {
     }
 }
 
-fn read_object(object: &Object, method: &Method, headers: &hyper::HeaderMap) -> Reply {
+fn read_object(
+    object: &Object,
+    method: &Method,
+    headers: &hyper::HeaderMap,
+    overrides: &[(String, String)],
+) -> Reply {
     let len = object.bytes.len();
     let range = headers.get(RANGE).and_then(|value| value.to_str().ok());
     let (status, start, end) = match range {
@@ -392,8 +405,14 @@ fn read_object(object: &Object, method: &Method, headers: &hyper::HeaderMap) -> 
     if status == StatusCode::PARTIAL_CONTENT {
         response = response.header(CONTENT_RANGE, format!("bytes {start}-{}/{len}", end - 1));
     }
+    let overridden = |name: &str| overrides.iter().any(|(header, _)| header == name);
     if let Some(content_type) = &object.content_type {
-        response = response.header(CONTENT_TYPE, content_type);
+        if !overridden("content-type") {
+            response = response.header(CONTENT_TYPE, content_type);
+        }
+    }
+    for (header, value) in overrides {
+        response = response.header(header.as_str(), value.as_str());
     }
     for (name, value) in &object.metadata {
         response = response.header(name, value);

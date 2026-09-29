@@ -70,6 +70,7 @@ The `store-stream` resumable API can also use `object_store::memory::InMemory` d
 | Multipart | CreateMultipartUpload, UploadPart, ListParts, ListMultipartUploads, CompleteMultipartUpload, AbortMultipartUpload |
 
 GetObject and HeadObject accept one HTTP byte range.
+GetObject and HeadObject apply the `response-*` query parameters, such as `response-content-disposition`, as response headers.
 PutObject stores content type and user metadata.
 Unsupported API operations return `NotImplemented`.
 

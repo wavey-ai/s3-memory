@@ -175,6 +175,39 @@ async fn bucket_objects_ranges_copy_listing_and_deletion() {
 }
 
 #[tokio::test]
+async fn get_applies_response_header_overrides() {
+    let server = MemoryS3::new().start().await.unwrap();
+    let s3 = client(server.endpoint());
+    s3.create_bucket().bucket("testing").send().await.unwrap();
+    s3.put_object()
+        .bucket("testing")
+        .key("brief.txt")
+        .content_type("text/plain")
+        .body(ByteStream::from_static(b"brief"))
+        .send()
+        .await
+        .unwrap();
+    let object = s3
+        .get_object()
+        .bucket("testing")
+        .key("brief.txt")
+        .response_content_disposition("attachment; filename=\"brief.txt\"")
+        .response_content_type("application/octet-stream")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        object.content_disposition(),
+        Some("attachment; filename=\"brief.txt\"")
+    );
+    assert_eq!(object.content_type(), Some("application/octet-stream"));
+    assert_eq!(
+        object.body.collect().await.unwrap().into_bytes().as_ref(),
+        b"brief"
+    );
+}
+
+#[tokio::test]
 async fn multipart_upload_and_abort() {
     let store = MemoryS3::new();
     let server = store.start().await.unwrap();
