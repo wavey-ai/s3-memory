@@ -1,5 +1,6 @@
 use super::{
-    empty, error, escape, make_object, remove_object, store_object_bounded, timestamp, xml, Query,
+    empty, error, escape, header_string, make_object, remove_object, store_object_bounded,
+    timestamp, xml, Query,
 };
 use crate::{Reply, State, Upload};
 use bytes::Bytes;
@@ -50,11 +51,9 @@ pub(super) fn create_upload(
             bucket: bucket.to_owned(),
             key: key.to_owned(),
             parts: Default::default(),
-            content_type: headers
-                .get(hyper::header::CONTENT_TYPE)
-                .and_then(|v| v.to_str().ok())
-                .map(str::to_owned),
+            content_type: header_string(headers, hyper::header::CONTENT_TYPE.as_str()),
             metadata,
+            encryption: header_string(headers, "x-amz-server-side-encryption"),
         },
     );
     xml(StatusCode::OK, format!(
@@ -165,6 +164,7 @@ pub(super) fn upload_request(
             object.etag = format!("\"{:x}-{part_count}\"", combined_digest.finalize());
             object.content_type = upload.content_type.clone();
             object.metadata = upload.metadata.clone();
+            object.encryption = upload.encryption.clone();
             let etag = object.etag.clone();
             let released = upload
                 .parts

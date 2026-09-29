@@ -6,6 +6,11 @@ use arc_swap::ArcSwapOption;
 use bytes::Bytes;
 use http_body_util::{BodyExt, Full, Limited};
 use hyper::body::Incoming;
+use hyper::header::{
+    HeaderValue, ACCESS_CONTROL_ALLOW_HEADERS, ACCESS_CONTROL_ALLOW_METHODS,
+    ACCESS_CONTROL_ALLOW_ORIGIN, ACCESS_CONTROL_EXPOSE_HEADERS, ACCESS_CONTROL_REQUEST_HEADERS,
+    ORIGIN, VARY,
+};
 use hyper::service::service_fn;
 use hyper::{Method, Request, Response};
 use hyper_util::rt::TokioIo;
@@ -22,11 +27,20 @@ use tokio::task::JoinHandle;
 
 pub(crate) type Reply = Response<Full<Bytes>>;
 
+const DEFAULT_CORS_ORIGINS: [&str; 4] = [
+    "http://localhost:3000",
+    "http://127.0.0.1:3000",
+    "http://localhost:3001",
+    "http://127.0.0.1:3001",
+];
+
 #[derive(Clone)]
 pub struct MemoryS3 {
     state: Arc<RwLock<State>>,
     max_request_bytes: usize,
     max_stored_bytes: usize,
+    container_listener: bool,
+    cors_origins: Arc<[String]>,
 }
 
 #[derive(Default)]
@@ -62,6 +76,7 @@ pub(crate) struct Object {
     pub modified: SystemTime,
     pub content_type: Option<String>,
     pub metadata: Vec<(String, String)>,
+    pub encryption: Option<String>,
 }
 
 pub(crate) struct Upload {
@@ -70,6 +85,7 @@ pub(crate) struct Upload {
     pub parts: BTreeMap<u32, Object>,
     pub content_type: Option<String>,
     pub metadata: Vec<(String, String)>,
+    pub encryption: Option<String>,
 }
 
 pub struct RunningServer {
@@ -131,7 +147,25 @@ impl MemoryS3 {
             state: Arc::new(RwLock::new(State::default())),
             max_request_bytes: 64 * 1024 * 1024,
             max_stored_bytes: 512 * 1024 * 1024,
+            container_listener: false,
+            cors_origins: DEFAULT_CORS_ORIGINS.map(String::from).into(),
         }
+    }
+
+    /// Lets `listen` bind an unspecified address, such as `0.0.0.0`, for use inside a container.
+    pub fn with_container_listener(mut self) -> Self {
+        self.container_listener = true;
+        self
+    }
+
+    /// Sets the request origins that receive CORS headers.
+    pub fn with_cors_origins<I, S>(mut self, origins: I) -> Self
+    where
+        I: IntoIterator<Item = S>,
+        S: Into<String>,
+    {
+        self.cors_origins = origins.into_iter().map(Into::into).collect();
+        self
     }
 
     pub fn with_max_request_bytes(mut self, bytes: usize) -> Self {
@@ -219,10 +253,11 @@ impl MemoryS3 {
     }
 
     pub async fn listen(&self, address: SocketAddr) -> io::Result<RunningServer> {
-        if !address.ip().is_loopback() {
+        let ip = address.ip();
+        if !(ip.is_loopback() || self.container_listener && ip.is_unspecified()) {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
-                "s3-memory accepts loopback addresses only",
+                "s3-memory accepts loopback addresses, or unspecified addresses with a container listener",
             ));
         }
         let listener = TcpListener::bind(address).await?;
@@ -258,6 +293,41 @@ impl MemoryS3 {
 
     async fn handle(&self, request: Request<Incoming>) -> Reply {
         let (parts, body) = request.into_parts();
+        let mut response = self.respond(&parts, body).await;
+        if let Some(origin) = parts.headers.get(ORIGIN) {
+            self.add_cors(&mut response, origin, &parts.headers);
+        }
+        response
+    }
+
+    fn add_cors(&self, response: &mut Reply, origin: &HeaderValue, request: &hyper::HeaderMap) {
+        if !self
+            .cors_origins
+            .iter()
+            .any(|allowed| allowed.as_bytes() == origin.as_bytes())
+        {
+            return;
+        }
+        let headers = response.headers_mut();
+        headers.insert(ACCESS_CONTROL_ALLOW_ORIGIN, origin.clone());
+        headers.insert(
+            ACCESS_CONTROL_ALLOW_METHODS,
+            HeaderValue::from_static("GET, HEAD, PUT, POST, DELETE"),
+        );
+        if let Some(requested) = request.get(ACCESS_CONTROL_REQUEST_HEADERS) {
+            headers.insert(ACCESS_CONTROL_ALLOW_HEADERS, requested.clone());
+        }
+        headers.insert(
+            ACCESS_CONTROL_EXPOSE_HEADERS,
+            HeaderValue::from_static("ETag, Content-Length, x-amz-server-side-encryption"),
+        );
+        headers.insert(VARY, HeaderValue::from_static("Origin"));
+    }
+
+    async fn respond(&self, parts: &hyper::http::request::Parts, body: Incoming) -> Reply {
+        if parts.method == Method::OPTIONS {
+            return protocol::empty(hyper::StatusCode::NO_CONTENT);
+        }
         let payload = if parts.method == Method::PUT || parts.method == Method::POST {
             match Limited::new(body, self.max_request_bytes).collect().await {
                 Ok(body) => body.to_bytes(),
@@ -272,26 +342,44 @@ impl MemoryS3 {
         } else {
             Bytes::new()
         };
-        if let Some((bucket, key)) = protocol::basic_put_path(&parts) {
+        let payload = if parts.method == Method::PUT {
+            match protocol::decode_aws_chunked(&parts.headers, payload) {
+                Ok(payload) => payload,
+                Err(()) => {
+                    return protocol::error(
+                        hyper::StatusCode::BAD_REQUEST,
+                        "InvalidRequest",
+                        parts.uri.path(),
+                    )
+                }
+            }
+        } else {
+            payload
+        };
+        if let Some((bucket, key)) = protocol::basic_put_path(parts) {
             let object = protocol::make_object(payload, &parts.headers);
             return protocol::write_object(
                 &mut self.state.write().unwrap(),
                 &bucket,
                 key,
                 object,
+                &parts.headers,
                 self.max_stored_bytes,
             );
         }
         let hot_read = {
             let state = self.state.read().unwrap();
-            protocol::hot_lookup(&state, &parts)
+            protocol::hot_lookup(&state, parts)
         };
         if let Some(snapshot) = hot_read {
-            return protocol::render_hot(snapshot, &parts);
+            return protocol::render_hot(snapshot, parts);
+        }
+        if parts.method == Method::GET && parts.uri.path() == "/__health" {
+            return protocol::empty(hyper::StatusCode::OK);
         }
         protocol::route(
             &mut self.state.write().unwrap(),
-            &parts,
+            parts,
             payload,
             self.max_stored_bytes,
         )

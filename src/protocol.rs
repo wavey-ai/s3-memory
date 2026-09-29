@@ -3,7 +3,11 @@ use arc_swap::ArcSwapOption;
 use bytes::Bytes;
 use chrono::{DateTime, Utc};
 use http_body_util::Full;
-use hyper::header::{CONTENT_LENGTH, CONTENT_RANGE, CONTENT_TYPE, ETAG, LAST_MODIFIED, RANGE};
+use hyper::header::{
+    HeaderName, HeaderValue, CACHE_CONTROL, CONTENT_DISPOSITION, CONTENT_ENCODING,
+    CONTENT_LANGUAGE, CONTENT_LENGTH, CONTENT_RANGE, CONTENT_TYPE, ETAG, EXPIRES, IF_MATCH,
+    IF_NONE_MATCH, LAST_MODIFIED, RANGE,
+};
 use hyper::{Method, StatusCode};
 use md5::{Digest, Md5};
 use percent_encoding::percent_decode_str;
@@ -26,8 +30,11 @@ pub(crate) fn hot_lookup(state: &State, parts: &hyper::http::request::Parts) -> 
     if parts.method != Method::GET && parts.method != Method::HEAD {
         return None;
     }
+    if parts.headers.contains_key(IF_MATCH) || parts.headers.contains_key(IF_NONE_MATCH) {
+        return None;
+    }
     if parts.uri.query().is_some_and(|query| {
-        form_urlencoded::parse(query.as_bytes()).any(|(name, _)| name != "x-id")
+        form_urlencoded::parse(query.as_bytes()).any(|(name, _)| !ignored_parameter(&name))
     }) {
         return None;
     }
@@ -45,12 +52,21 @@ pub(crate) fn hot_lookup(state: &State, parts: &hyper::http::request::Parts) -> 
     })
 }
 
+/// Presigned URLs carry their signature and checksum settings in `x-amz-*` parameters,
+/// and SDKs add `x-id`. None of these parameters selects an operation.
+fn ignored_parameter(name: &str) -> bool {
+    name == "x-id"
+        || name
+            .get(..6)
+            .is_some_and(|prefix| prefix.eq_ignore_ascii_case("x-amz-"))
+}
+
 pub(crate) fn basic_put_path(parts: &hyper::http::request::Parts) -> Option<(String, String)> {
     if parts.method != Method::PUT || parts.headers.contains_key("x-amz-copy-source") {
         return None;
     }
     if parts.uri.query().is_some_and(|query| {
-        form_urlencoded::parse(query.as_bytes()).any(|(name, _)| name != "x-id")
+        form_urlencoded::parse(query.as_bytes()).any(|(name, _)| !ignored_parameter(&name))
     }) {
         return None;
     }
@@ -67,10 +83,14 @@ pub(crate) fn write_object(
     bucket: &str,
     key: String,
     object: Object,
+    headers: &hyper::HeaderMap,
     max_stored_bytes: usize,
 ) -> Reply {
-    if !state.buckets.contains_key(bucket) {
+    let Some(bucket_state) = state.buckets.get(bucket) else {
         return error(StatusCode::NOT_FOUND, "NoSuchBucket", bucket);
+    };
+    if let Some((status, code)) = put_precondition(bucket_state, &key, headers) {
+        return error(status, code, &key);
     }
     let etag = object.etag.clone();
     if store_object_bounded(state, bucket, key.clone(), object, max_stored_bytes).is_err() {
@@ -81,6 +101,135 @@ pub(crate) fn write_object(
         .header(ETAG, etag)
         .body(Full::new(Bytes::new()))
         .unwrap()
+}
+
+/// Applies `If-None-Match: *` and `If-Match: <etag>` to a write and returns the failure.
+fn put_precondition(
+    bucket: &Bucket,
+    key: &str,
+    headers: &hyper::HeaderMap,
+) -> Option<(StatusCode, &'static str)> {
+    let if_match = headers.get(IF_MATCH);
+    let if_none_match = headers.get(IF_NONE_MATCH);
+    if if_match.is_none() && if_none_match.is_none() {
+        return None;
+    }
+    let if_match = match if_match.map(HeaderValue::to_str) {
+        Some(Err(_)) => return Some((StatusCode::BAD_REQUEST, "InvalidArgument")),
+        Some(Ok(value)) => Some(value.trim().trim_matches('"')),
+        None => None,
+    };
+    if if_none_match.is_some_and(|value| value != "*") {
+        return Some((StatusCode::BAD_REQUEST, "InvalidArgument"));
+    }
+    let existing = bucket.objects.get(key).map(|entry| &entry.object);
+    let failed = if_none_match.is_some() && existing.is_some()
+        || if_match.is_some_and(|expected| {
+            existing.is_none_or(|object| object.etag.trim_matches('"') != expected)
+        });
+    failed.then_some((StatusCode::PRECONDITION_FAILED, "PreconditionFailed"))
+}
+
+/// Applies `If-Match` and `If-None-Match` to a read and returns the reply that replaces it.
+fn read_precondition(
+    object: &Object,
+    method: &Method,
+    key: &str,
+    headers: &hyper::HeaderMap,
+) -> Option<Reply> {
+    if let Some(expected) = headers.get(IF_MATCH) {
+        if !etag_matches(expected, &object.etag) {
+            return Some(if *method == Method::HEAD {
+                empty(StatusCode::PRECONDITION_FAILED)
+            } else {
+                error(StatusCode::PRECONDITION_FAILED, "PreconditionFailed", key)
+            });
+        }
+    } else if let Some(expected) = headers.get(IF_NONE_MATCH) {
+        if etag_matches(expected, &object.etag) {
+            return Some(
+                hyper::Response::builder()
+                    .status(StatusCode::NOT_MODIFIED)
+                    .header(ETAG, object.etag.as_str())
+                    .body(Full::new(Bytes::new()))
+                    .unwrap(),
+            );
+        }
+    }
+    None
+}
+
+/// Compares a read precondition with an ETag: `*`, or any listed tag, weak or strong.
+fn etag_matches(expected: &HeaderValue, etag: &str) -> bool {
+    let Ok(expected) = expected.to_str() else {
+        return false;
+    };
+    expected
+        .split(',')
+        .map(str::trim)
+        .any(|candidate| candidate == "*" || candidate.trim_start_matches("W/") == etag)
+}
+
+/// Decodes an `aws-chunked` body to its `x-amz-decoded-content-length` bytes and drops trailers.
+pub(crate) fn decode_aws_chunked(headers: &hyper::HeaderMap, payload: Bytes) -> Result<Bytes, ()> {
+    let encoded = headers
+        .get(CONTENT_ENCODING)
+        .and_then(|value| value.to_str().ok())
+        .is_some_and(|value| value.split(',').any(|part| part.trim() == "aws-chunked"));
+    if !encoded {
+        return Ok(payload);
+    }
+    let expected: usize = headers
+        .get("x-amz-decoded-content-length")
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.parse().ok())
+        .ok_or(())?;
+    if expected > payload.len() {
+        return Err(());
+    }
+    let line_end = |from: usize| {
+        payload[from..]
+            .windows(2)
+            .position(|window| window == b"\r\n")
+            .map(|offset| from + offset)
+            .ok_or(())
+    };
+    let mut decoded = Vec::with_capacity(expected);
+    let mut position = 0;
+    loop {
+        let end = line_end(position)?;
+        let line = std::str::from_utf8(&payload[position..end]).map_err(|_| ())?;
+        let size = usize::from_str_radix(line.split(';').next().ok_or(())?, 16).map_err(|_| ())?;
+        position = end + 2;
+        if size == 0 {
+            loop {
+                let end = line_end(position)?;
+                let trailer = &payload[position..end];
+                position = end + 2;
+                if trailer.is_empty() {
+                    break;
+                }
+                if !trailer.contains(&b':') {
+                    return Err(());
+                }
+            }
+            break;
+        }
+        let data_end = position.checked_add(size).ok_or(())?;
+        let terminator_end = data_end.checked_add(2).ok_or(())?;
+        if terminator_end > payload.len() || &payload[data_end..terminator_end] != b"\r\n" {
+            return Err(());
+        }
+        decoded.extend_from_slice(&payload[position..data_end]);
+        if decoded.len() > expected {
+            return Err(());
+        }
+        position = terminator_end;
+    }
+    if decoded.len() != expected || position != payload.len() {
+        return Err(());
+    }
+    Ok(Bytes::from(decoded))
 }
 
 pub(crate) fn render_hot(snapshot: HotRead, parts: &hyper::http::request::Parts) -> Reply {
@@ -109,6 +258,10 @@ pub(crate) fn route(
     payload: Bytes,
     max_stored_bytes: usize,
 ) -> Reply {
+    if parts.method == Method::POST && parts.uri.path() == "/__reset" {
+        reset(state);
+        return empty(StatusCode::NO_CONTENT);
+    }
     let path = percent_decode_str(parts.uri.path()).decode_utf8_lossy();
     let mut path_parts = path.trim_start_matches('/').splitn(2, '/');
     let bucket = path_parts.next().unwrap_or("");
@@ -116,7 +269,7 @@ pub(crate) fn route(
     let mut query: Query = form_urlencoded::parse(parts.uri.query().unwrap_or("").as_bytes())
         .into_owned()
         .collect();
-    query.remove("x-id");
+    query.retain(|name, _| !ignored_parameter(name));
 
     if bucket.is_empty() {
         return if parts.method == Method::GET {
@@ -138,6 +291,17 @@ pub(crate) fn route(
         payload,
         max_stored_bytes,
     )
+}
+
+/// Removes every object and multipart upload and keeps the buckets.
+fn reset(state: &mut State) {
+    for bucket in state.buckets.values_mut() {
+        for (_, entry) in bucket.objects.drain() {
+            entry.slot.store(None);
+        }
+    }
+    state.uploads.clear();
+    state.stored_bytes = 0;
 }
 
 fn bucket_request(
@@ -222,18 +386,32 @@ fn object_request(
             max_stored_bytes,
         );
     }
-    // A GET may override its response headers through S3's `response-*` parameters.
-    let overrides: Vec<(String, String)> = query
-        .iter()
-        .filter_map(|(name, value)| {
-            name.strip_prefix("response-")
-                .map(|header| (header.to_owned(), value.clone()))
-        })
-        .collect();
-    if query.keys().any(|name| !name.starts_with("response-")) {
-        return error(StatusCode::NOT_IMPLEMENTED, "NotImplemented", key);
+    let reads = *method == Method::GET || *method == Method::HEAD;
+    let mut overrides = Vec::new();
+    for (name, value) in query {
+        let Some(header) = reads.then(|| override_header(name)).flatten() else {
+            return error(StatusCode::NOT_IMPLEMENTED, "NotImplemented", key);
+        };
+        let Ok(value) = HeaderValue::from_str(value) else {
+            return error(StatusCode::BAD_REQUEST, "InvalidArgument", name);
+        };
+        overrides.push((header, value));
     }
     if *method == Method::PUT {
+        if !headers.contains_key("x-amz-copy-source") {
+            let object = make_object(payload, headers);
+            return write_object(
+                state,
+                bucket,
+                key.to_owned(),
+                object,
+                headers,
+                max_stored_bytes,
+            );
+        }
+        if let Some((status, code)) = put_precondition(&state.buckets[bucket], key, headers) {
+            return error(status, code, key);
+        }
         if let Some(source) = headers.get("x-amz-copy-source") {
             let source = source.to_str().unwrap_or("");
             let source = percent_decode_str(source.trim_start_matches('/')).decode_utf8_lossy();
@@ -249,10 +427,13 @@ fn object_request(
             else {
                 return error(StatusCode::NOT_FOUND, "NoSuchKey", source_key);
             };
-            let copied = Object {
+            let mut copied = Object {
                 modified: SystemTime::now(),
                 ..(*original).clone()
             };
+            if let Some(encryption) = header_string(headers, "x-amz-server-side-encryption") {
+                copied.encryption = Some(encryption);
+            }
             if store_object_bounded(
                 state,
                 bucket,
@@ -269,16 +450,6 @@ fn object_request(
                 timestamp(copied.modified), copied.etag,
             ));
         }
-        let object = make_object(payload, headers);
-        let etag = object.etag.clone();
-        if store_object_bounded(state, bucket, key.to_owned(), object, max_stored_bytes).is_err() {
-            return error(StatusCode::INSUFFICIENT_STORAGE, "StorageFull", key);
-        }
-        return hyper::Response::builder()
-            .status(StatusCode::OK)
-            .header(ETAG, etag)
-            .body(Full::new(Bytes::new()))
-            .unwrap();
     }
     if *method == Method::DELETE {
         if let Some(size) = remove_object(state.buckets.get_mut(bucket).unwrap(), key) {
@@ -299,9 +470,23 @@ fn object_request(
                 error(StatusCode::NOT_FOUND, "NoSuchKey", key)
             };
         };
-        return read_object(&object, method, headers, &overrides);
+        return read_precondition(&object, method, key, headers)
+            .unwrap_or_else(|| read_object(&object, method, headers, &overrides));
     }
     error(StatusCode::NOT_IMPLEMENTED, "NotImplemented", key)
+}
+
+/// Maps an S3 response override parameter to the header it sets.
+fn override_header(parameter: &str) -> Option<HeaderName> {
+    Some(match parameter {
+        "response-cache-control" => CACHE_CONTROL,
+        "response-content-disposition" => CONTENT_DISPOSITION,
+        "response-content-encoding" => CONTENT_ENCODING,
+        "response-content-language" => CONTENT_LANGUAGE,
+        "response-content-type" => CONTENT_TYPE,
+        "response-expires" => EXPIRES,
+        _ => return None,
+    })
 }
 
 pub(crate) fn store_object(bucket: &mut Bucket, key: String, object: Object) {
@@ -368,19 +553,24 @@ pub(crate) fn make_object(bytes: Bytes, headers: &hyper::HeaderMap) -> Object {
         bytes,
         etag: format!("\"{digest:x}\""),
         modified: SystemTime::now(),
-        content_type: headers
-            .get(CONTENT_TYPE)
-            .and_then(|v| v.to_str().ok())
-            .map(str::to_owned),
+        content_type: header_string(headers, CONTENT_TYPE.as_str()),
         metadata,
+        encryption: header_string(headers, "x-amz-server-side-encryption"),
     }
+}
+
+pub(crate) fn header_string(headers: &hyper::HeaderMap, name: &str) -> Option<String> {
+    headers
+        .get(name)
+        .and_then(|value| value.to_str().ok())
+        .map(str::to_owned)
 }
 
 fn read_object(
     object: &Object,
     method: &Method,
     headers: &hyper::HeaderMap,
-    overrides: &[(String, String)],
+    overrides: &[(HeaderName, HeaderValue)],
 ) -> Reply {
     let len = object.bytes.len();
     let range = headers.get(RANGE).and_then(|value| value.to_str().ok());
@@ -405,14 +595,22 @@ fn read_object(
     if status == StatusCode::PARTIAL_CONTENT {
         response = response.header(CONTENT_RANGE, format!("bytes {start}-{}/{len}", end - 1));
     }
-    let overridden = |name: &str| overrides.iter().any(|(header, _)| header == name);
+    // S3 applies response overrides to complete responses only.
+    let overrides = if status == StatusCode::OK {
+        overrides
+    } else {
+        &[]
+    };
     if let Some(content_type) = &object.content_type {
-        if !overridden("content-type") {
+        if !overrides.iter().any(|(header, _)| header == CONTENT_TYPE) {
             response = response.header(CONTENT_TYPE, content_type);
         }
     }
     for (header, value) in overrides {
-        response = response.header(header.as_str(), value.as_str());
+        response = response.header(header, value);
+    }
+    if let Some(encryption) = &object.encryption {
+        response = response.header("x-amz-server-side-encryption", encryption);
     }
     for (name, value) in &object.metadata {
         response = response.header(name, value);
@@ -585,5 +783,21 @@ mod tests {
         assert_eq!(parse_range("bytes=-3", 10), Some((7, 10)));
         assert_eq!(parse_range("bytes=10-", 10), None);
         assert_eq!(parse_range("bytes=4-2", 10), None);
+    }
+
+    #[test]
+    fn aws_chunked_payload_excludes_metadata_and_rejects_wrong_length() {
+        let mut headers = hyper::HeaderMap::new();
+        headers.insert(CONTENT_ENCODING, "aws-chunked".parse().unwrap());
+        headers.insert("x-amz-decoded-content-length", "5".parse().unwrap());
+        let encoded = Bytes::from_static(
+            b"2;chunk-signature=a\r\nhe\r\n3;chunk-signature=b\r\nllo\r\n0;chunk-signature=c\r\nx-amz-checksum-crc32:abc=\r\n\r\n",
+        );
+        assert_eq!(
+            decode_aws_chunked(&headers, encoded.clone()),
+            Ok(Bytes::from_static(b"hello"))
+        );
+        headers.insert("x-amz-decoded-content-length", "4".parse().unwrap());
+        assert_eq!(decode_aws_chunked(&headers, encoded), Err(()));
     }
 }
