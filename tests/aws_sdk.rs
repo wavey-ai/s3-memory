@@ -998,3 +998,44 @@ async fn object_tagging_round_trips() {
     );
     server.stop().await;
 }
+
+#[tokio::test]
+async fn injected_write_failures_fail_writes_then_recover() {
+    let store = MemoryS3::new();
+    let server = store.start().await.unwrap();
+    let s3 = Client::from_conf(
+        aws_sdk_s3::config::Builder::new()
+            .endpoint_url(server.endpoint())
+            .credentials_provider(Credentials::new("test", "test", None, None, "tests"))
+            .region(Region::new("us-east-1"))
+            .force_path_style(true)
+            // The SDK retries 5xx itself; with retries off each injected failure is observable.
+            .retry_config(aws_sdk_s3::config::retry::RetryConfig::disabled())
+            .build(),
+    );
+    s3.create_bucket().bucket("faults").send().await.unwrap();
+
+    store.fail_next_writes(2, 503);
+    let put = || {
+        s3.put_object()
+            .bucket("faults")
+            .key("object")
+            .body(ByteStream::from_static(b"value"))
+            .send()
+    };
+    assert_eq!(failure(put().await), 503);
+    assert_eq!(store.pending_write_failures(), 1);
+    // Reads are never failed.
+    assert_eq!(
+        failure(s3.get_object().bucket("faults").key("object").send().await),
+        404
+    );
+    assert_eq!(failure(put().await), 503);
+    put().await.unwrap();
+    assert_eq!(store.get_object("faults", "object").unwrap(), "value");
+
+    store.fail_next_writes(1, 403);
+    assert_eq!(failure(put().await), 403);
+    put().await.unwrap();
+    server.stop().await;
+}

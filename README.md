@@ -36,6 +36,20 @@ The default storage limit is 512 MiB.
 Writes that exceed this limit return `StorageFull` with HTTP status 507.
 The rejected write keeps the previous object or part.
 
+## Fault injection
+
+```rust
+let store = MemoryS3::new();
+let server = store.start().await?;
+store.fail_next_writes(2, 503); // the next two object writes answer 503 SlowDown
+```
+
+`fail_next_writes(count, status)` fails the next `count` object writes (PutObject, UploadPart,
+CompleteMultipartUpload, PutObjectTagging) with `status` and stores nothing; reads are unaffected.
+SDKs retry 5xx responses themselves, so use a 4xx (`403` answers `AccessDenied`, others
+`InvalidRequest`) to surface a failure to the caller. `pending_write_failures` reports how many are
+left.
+
 ## Direct store API
 
 ```rust

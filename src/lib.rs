@@ -19,7 +19,7 @@ use std::convert::Infallible;
 use std::fmt;
 use std::io;
 use std::net::{Ipv4Addr, SocketAddr};
-use std::sync::{Arc, RwLock};
+use std::sync::{Arc, Mutex, RwLock};
 use std::time::SystemTime;
 use tokio::net::TcpListener;
 use tokio::sync::oneshot;
@@ -41,6 +41,14 @@ pub struct MemoryS3 {
     max_stored_bytes: usize,
     container_listener: bool,
     cors_origins: Arc<[String]>,
+    write_faults: Arc<Mutex<WriteFaults>>,
+}
+
+/// Injected failures for the next object writes (see [`MemoryS3::fail_next_writes`]).
+#[derive(Default)]
+struct WriteFaults {
+    remaining: usize,
+    status: u16,
 }
 
 #[derive(Default)]
@@ -151,7 +159,54 @@ impl MemoryS3 {
             max_stored_bytes: 512 * 1024 * 1024,
             container_listener: false,
             cors_origins: DEFAULT_CORS_ORIGINS.map(String::from).into(),
+            write_faults: Arc::default(),
         }
+    }
+
+    /// Fails the next `count` object writes (PutObject, UploadPart, CompleteMultipartUpload and
+    /// PutObjectTagging) with HTTP `status`, storing nothing, then serves writes normally again.
+    ///
+    /// The status decides who retries: SDKs retry 5xx responses themselves (`503` answers
+    /// `SlowDown`), while most 4xx responses (`403` answers `AccessDenied`, others
+    /// `InvalidRequest`) surface to the caller at once.
+    pub fn fail_next_writes(&self, count: usize, status: u16) {
+        *self.write_faults.lock().unwrap() = WriteFaults {
+            remaining: count,
+            status,
+        };
+    }
+
+    /// How many injected write failures are still to come.
+    pub fn pending_write_failures(&self) -> usize {
+        self.write_faults.lock().unwrap().remaining
+    }
+
+    /// An injected failure for this request, if it is an object write and one is due.
+    fn injected_write_failure(&self, parts: &hyper::http::request::Parts) -> Option<Reply> {
+        let writes = parts.method == Method::PUT || parts.method == Method::POST;
+        let object = parts
+            .uri
+            .path()
+            .trim_start_matches('/')
+            .split_once('/')
+            .is_some_and(|(_, key)| !key.is_empty());
+        if !writes || !object {
+            return None;
+        }
+        let mut faults = self.write_faults.lock().unwrap();
+        if faults.remaining == 0 {
+            return None;
+        }
+        faults.remaining -= 1;
+        let status = hyper::StatusCode::from_u16(faults.status)
+            .unwrap_or(hyper::StatusCode::SERVICE_UNAVAILABLE);
+        let code = match status.as_u16() {
+            503 => "SlowDown",
+            500 => "InternalError",
+            403 => "AccessDenied",
+            _ => "InvalidRequest",
+        };
+        Some(protocol::error(status, code, parts.uri.path()))
     }
 
     /// Lets `listen` bind an unspecified address, such as `0.0.0.0`, for use inside a container.
@@ -329,6 +384,9 @@ impl MemoryS3 {
     async fn respond(&self, parts: &hyper::http::request::Parts, body: Incoming) -> Reply {
         if parts.method == Method::OPTIONS {
             return protocol::empty(hyper::StatusCode::NO_CONTENT);
+        }
+        if let Some(failure) = self.injected_write_failure(parts) {
+            return failure;
         }
         let payload = if parts.method == Method::PUT || parts.method == Method::POST {
             match Limited::new(body, self.max_request_bytes).collect().await {
