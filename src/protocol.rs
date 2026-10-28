@@ -386,6 +386,9 @@ fn object_request(
             max_stored_bytes,
         );
     }
+    if query.contains_key("tagging") {
+        return object_tagging(state, method, bucket, key, &payload);
+    }
     let reads = *method == Method::GET || *method == Method::HEAD;
     let mut overrides = Vec::new();
     for (name, value) in query {
@@ -476,6 +479,63 @@ fn object_request(
     error(StatusCode::NOT_IMPLEMENTED, "NotImplemented", key)
 }
 
+/// GetObjectTagging, PutObjectTagging (which replaces the whole tag set) and DeleteObjectTagging.
+fn object_tagging(
+    state: &mut State,
+    method: &Method,
+    bucket: &str,
+    key: &str,
+    payload: &[u8],
+) -> Reply {
+    let Some(entry) = state
+        .buckets
+        .get_mut(bucket)
+        .and_then(|bucket| bucket.objects.get_mut(key))
+    else {
+        return error(StatusCode::NOT_FOUND, "NoSuchKey", key);
+    };
+    let tags = match *method {
+        Method::GET => {
+            let mut body = String::from("<Tagging><TagSet>");
+            for (name, value) in &entry.object.tags {
+                body.push_str(&format!(
+                    "<Tag><Key>{}</Key><Value>{}</Value></Tag>",
+                    escape(name),
+                    escape(value)
+                ));
+            }
+            body.push_str("</TagSet></Tagging>");
+            return xml(StatusCode::OK, body);
+        }
+        Method::PUT => {
+            let (Some(names), Some(values)) = (
+                multipart::xml_values(payload, "Key"),
+                multipart::xml_values(payload, "Value"),
+            ) else {
+                return error(StatusCode::BAD_REQUEST, "MalformedXML", key);
+            };
+            if names.len() != values.len() {
+                return error(StatusCode::BAD_REQUEST, "MalformedXML", key);
+            }
+            names.into_iter().zip(values).collect()
+        }
+        Method::DELETE => Vec::new(),
+        _ => return error(StatusCode::NOT_IMPLEMENTED, "NotImplemented", key),
+    };
+    // Tags change the object's metadata only: same bytes, ETag and modification time.
+    let updated = Arc::new(Object {
+        tags,
+        ..(*entry.object).clone()
+    });
+    entry.slot.store(Some(Arc::clone(&updated)));
+    entry.object = updated;
+    if *method == Method::DELETE {
+        empty(StatusCode::NO_CONTENT)
+    } else {
+        empty(StatusCode::OK)
+    }
+}
+
 /// Maps an S3 response override parameter to the header it sets.
 fn override_header(parameter: &str) -> Option<HeaderName> {
     Some(match parameter {
@@ -556,6 +616,13 @@ pub(crate) fn make_object(bytes: Bytes, headers: &hyper::HeaderMap) -> Object {
         content_type: header_string(headers, CONTENT_TYPE.as_str()),
         metadata,
         encryption: header_string(headers, "x-amz-server-side-encryption"),
+        tags: header_string(headers, "x-amz-tagging")
+            .map(|tagging| {
+                form_urlencoded::parse(tagging.as_bytes())
+                    .into_owned()
+                    .collect()
+            })
+            .unwrap_or_default(),
     }
 }
 

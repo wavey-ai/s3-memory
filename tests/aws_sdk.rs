@@ -3,7 +3,7 @@ use aws_sdk_s3::presigning::PresigningConfig;
 use aws_sdk_s3::primitives::ByteStream;
 use aws_sdk_s3::types::{
     ChecksumAlgorithm, CompletedMultipartUpload, CompletedPart, Delete, ObjectIdentifier,
-    ServerSideEncryption,
+    ServerSideEncryption, Tag, Tagging,
 };
 use aws_sdk_s3::Client;
 use s3_memory::MemoryS3;
@@ -873,5 +873,169 @@ async fn cors_headers_follow_allowed_origins() {
     );
     let default = raw_request(&endpoint, "GET", "/__health", allowed, b"");
     assert!(!default.contains("access-control-"), "{default}");
+    server.stop().await;
+}
+
+#[tokio::test]
+async fn object_tagging_round_trips() {
+    let server = MemoryS3::new().start().await.unwrap();
+    let s3 = client(server.endpoint());
+    s3.create_bucket().bucket("tags").send().await.unwrap();
+    s3.put_object()
+        .bucket("tags")
+        .key("scanned")
+        .tagging("GuardDutyMalwareScanStatus=NO_THREATS_FOUND&owner=a%26b")
+        .body(ByteStream::from_static(b"clean"))
+        .send()
+        .await
+        .unwrap();
+    let tags = |output: aws_sdk_s3::operation::get_object_tagging::GetObjectTaggingOutput| {
+        output
+            .tag_set()
+            .iter()
+            .map(|tag| (tag.key().to_owned(), tag.value().to_owned()))
+            .collect::<Vec<_>>()
+    };
+
+    let tagged = s3
+        .get_object_tagging()
+        .bucket("tags")
+        .key("scanned")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        tags(tagged),
+        [
+            (
+                "GuardDutyMalwareScanStatus".to_owned(),
+                "NO_THREATS_FOUND".to_owned()
+            ),
+            ("owner".to_owned(), "a&b".to_owned()),
+        ]
+    );
+
+    let before = s3
+        .head_object()
+        .bucket("tags")
+        .key("scanned")
+        .send()
+        .await
+        .unwrap();
+    s3.put_object_tagging()
+        .bucket("tags")
+        .key("scanned")
+        .tagging(
+            Tagging::builder()
+                .tag_set(
+                    Tag::builder()
+                        .key("GuardDutyMalwareScanStatus")
+                        .value("THREATS_FOUND")
+                        .build()
+                        .unwrap(),
+                )
+                .build()
+                .unwrap(),
+        )
+        .send()
+        .await
+        .unwrap();
+    let replaced = s3
+        .get_object_tagging()
+        .bucket("tags")
+        .key("scanned")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        tags(replaced),
+        [(
+            "GuardDutyMalwareScanStatus".to_owned(),
+            "THREATS_FOUND".to_owned()
+        )]
+    );
+    let after = s3
+        .get_object()
+        .bucket("tags")
+        .key("scanned")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        after.e_tag(),
+        before.e_tag(),
+        "tagging keeps the object's ETag"
+    );
+    assert_eq!(
+        after.body.collect().await.unwrap().into_bytes().as_ref(),
+        b"clean"
+    );
+
+    s3.delete_object_tagging()
+        .bucket("tags")
+        .key("scanned")
+        .send()
+        .await
+        .unwrap();
+    let cleared = s3
+        .get_object_tagging()
+        .bucket("tags")
+        .key("scanned")
+        .send()
+        .await
+        .unwrap();
+    assert!(cleared.tag_set().is_empty());
+
+    assert_eq!(
+        failure(
+            s3.get_object_tagging()
+                .bucket("tags")
+                .key("missing")
+                .send()
+                .await
+        ),
+        404
+    );
+    server.stop().await;
+}
+
+#[tokio::test]
+async fn injected_write_failures_fail_writes_then_recover() {
+    let store = MemoryS3::new();
+    let server = store.start().await.unwrap();
+    let s3 = Client::from_conf(
+        aws_sdk_s3::config::Builder::new()
+            .endpoint_url(server.endpoint())
+            .credentials_provider(Credentials::new("test", "test", None, None, "tests"))
+            .region(Region::new("us-east-1"))
+            .force_path_style(true)
+            // The SDK retries 5xx itself; with retries off each injected failure is observable.
+            .retry_config(aws_sdk_s3::config::retry::RetryConfig::disabled())
+            .build(),
+    );
+    s3.create_bucket().bucket("faults").send().await.unwrap();
+
+    store.fail_next_writes(2, 503);
+    let put = || {
+        s3.put_object()
+            .bucket("faults")
+            .key("object")
+            .body(ByteStream::from_static(b"value"))
+            .send()
+    };
+    assert_eq!(failure(put().await), 503);
+    assert_eq!(store.pending_write_failures(), 1);
+    // Reads are never failed.
+    assert_eq!(
+        failure(s3.get_object().bucket("faults").key("object").send().await),
+        404
+    );
+    assert_eq!(failure(put().await), 503);
+    put().await.unwrap();
+    assert_eq!(store.get_object("faults", "object").unwrap(), "value");
+
+    store.fail_next_writes(1, 403);
+    assert_eq!(failure(put().await), 403);
+    put().await.unwrap();
     server.stop().await;
 }
