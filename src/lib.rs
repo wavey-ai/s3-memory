@@ -77,6 +77,8 @@ pub(crate) struct Object {
     pub content_type: Option<String>,
     pub metadata: Vec<(String, String)>,
     pub encryption: Option<String>,
+    /// Object tags, set by `x-amz-tagging` on PutObject or by PutObjectTagging.
+    pub tags: Vec<(String, String)>,
 }
 
 pub(crate) struct Upload {

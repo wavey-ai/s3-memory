@@ -217,7 +217,7 @@ pub(super) fn list_uploads(state: &State, bucket: &str) -> Reply {
     xml(StatusCode::OK, result)
 }
 
-fn xml_values(payload: &[u8], name: &str) -> Option<Vec<String>> {
+pub(crate) fn xml_values(payload: &[u8], name: &str) -> Option<Vec<String>> {
     let mut reader = Reader::from_reader(payload);
     let mut values = Vec::new();
     loop {

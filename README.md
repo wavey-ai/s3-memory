@@ -70,6 +70,7 @@ The `store-stream` resumable API can also use `object_store::memory::InMemory` d
 | Objects | PutObject, GetObject, HeadObject, DeleteObject, DeleteObjects, CopyObject |
 | Listing | ListObjects, ListObjectsV2 with prefix, delimiter, and pagination |
 | Multipart | CreateMultipartUpload, UploadPart, ListParts, ListMultipartUploads, CompleteMultipartUpload, AbortMultipartUpload |
+| Tagging | PutObject with `x-amz-tagging`, GetObjectTagging, PutObjectTagging, DeleteObjectTagging |
 
 GetObject and HeadObject accept one HTTP byte range.
 GetObject and HeadObject apply these query parameters as response headers on a complete (200) response:
